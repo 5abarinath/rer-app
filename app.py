@@ -124,23 +124,47 @@ def parse_sdmx_csv(text: str) -> pd.Series:
 
 
 def parse_sdmx_json(payload: dict) -> pd.Series:
-    """Parse an SDMX-JSON data message (time series at observation level)."""
-    try:
-        data = payload["data"]
-        structure = data["structures"][0]
-        obs_dims = structure["dimensions"].get("observation", [])
-        time_values = [v["id"] for v in obs_dims[0]["values"]]
-        series_map = data["dataSets"][0]["series"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise IMFDataError("Unexpected JSON layout.") from exc
-    if not series_map:
-        raise IMFDataError("Empty series.")
-    # The key restricts the query to one series; take the first.
-    observations = next(iter(series_map.values())).get("observations", {})
+    """Parse an SDMX-JSON data message (v1.0 or v2.0 layouts).
+
+    Handles time-series observations (series -> observations) as well as the
+    flat AllDimensions layout (observation key like "0:0:5").
+    """
+    root = payload.get("data", payload) if isinstance(payload, dict) else {}
+    structure = root.get("structure") or (root.get("structures") or [None])[0]
+    datasets = root.get("dataSets") or []
+    if not structure or not datasets:
+        raise IMFDataError(f"Unexpected JSON layout (keys: {sorted(root)[:8]}).")
+    dims = structure.get("dimensions", {})
+    obs_dims = dims.get("observation", [])
+    series_dims = dims.get("series", [])
+    time_pos = next((i for i, d in enumerate(obs_dims) if d.get("id") == "TIME_PERIOD"), None)
+
+    def label_of(v: dict) -> str:
+        return v.get("id") or v.get("value") or v.get("name") or ""
+
     periods, values = [], []
-    for idx, obs in observations.items():
-        periods.append(time_values[int(idx)])
-        values.append(obs[0])
+    ds = datasets[0]
+    if ds.get("series"):
+        if time_pos is None:
+            time_pos = 0
+        times = [label_of(v) for v in obs_dims[time_pos]["values"]]
+        # The key restricts the query to one series; take the first.
+        series = next(iter(ds["series"].values()))
+        for idx, obs in series.get("observations", {}).items():
+            periods.append(times[int(idx)])
+            values.append(obs[0])
+    elif ds.get("observations"):
+        # Flat layout: key is colon-joined indices over series + observation dims.
+        all_dims = series_dims + obs_dims
+        t = next((i for i, d in enumerate(all_dims) if d.get("id") == "TIME_PERIOD"), None)
+        if t is None:
+            raise IMFDataError("No TIME_PERIOD dimension in JSON.")
+        times = [label_of(v) for v in all_dims[t]["values"]]
+        for key, obs in ds["observations"].items():
+            periods.append(times[int(key.split(":")[t])])
+            values.append(obs[0])
+    else:
+        raise IMFDataError("JSON response contains no observations.")
     return _to_series(pd.Series(periods), pd.Series(values))
 
 
@@ -159,27 +183,27 @@ def _to_series(periods: pd.Series, values: pd.Series) -> pd.Series:
 def fetch_series(flow: str, key: str) -> pd.Series:
     """Download one monthly series from the IMF API (all history, from 1976)."""
     last_error = "unknown error"
+    attempts = (
+        ("application/vnd.sdmx.data+csv;version=2.0.0", "csv"),
+        ("application/vnd.sdmx.data+json;version=2.0.0", "json"),
+        ("application/json", "json"),
+    )
     for version in VERSION_TOKENS:
         url = f"{IMF_BASE}/data/dataflow/{flow}/{version}/{key}"
-        for accept, parser in (
-            ("application/vnd.sdmx.data+csv;version=2.0.0", "csv"),
-            ("application/vnd.sdmx.data+json;version=2.0.0", "json"),
-        ):
+        for accept, kind in attempts:
             try:
                 resp = requests.get(url, headers={"Accept": accept}, timeout=60)
             except requests.RequestException as exc:
                 last_error = f"network error: {exc}"
                 continue
-            if resp.status_code == 404:
-                last_error = "series not found (HTTP 404)"
-                continue
             if resp.status_code != 200:
-                last_error = f"HTTP {resp.status_code}"
+                last_error = f"HTTP {resp.status_code} ({accept})"
                 continue
             try:
-                s = parse_sdmx_csv(resp.text) if parser == "csv" else parse_sdmx_json(resp.json())
+                s = parse_sdmx_csv(resp.text) if kind == "csv" else parse_sdmx_json(resp.json())
             except (IMFDataError, ValueError) as exc:
-                last_error = str(exc)
+                snippet = resp.text[:200].replace("\n", " ")
+                last_error = f"{exc} ({accept}; response starts: {snippet!r})"
                 continue
             return s[s.index >= START_DATE]
     raise IMFDataError(f"{key}: {last_error}")
