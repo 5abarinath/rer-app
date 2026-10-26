@@ -25,6 +25,18 @@ CPI_KEY = "{iso}.CPI._T.IX.M"
 ER_KEY = "{iso}.XDC_USD.PA_RT.M"
 # SDMX 3.0 "latest version" tokens; the first that works is used.
 VERSION_TOKENS = ("+", "~")
+# Preferred dimension values when the exact key is empty and we fall back to a wildcard.
+CPI_PREFS = {
+    "INDEX_TYPE": ("CPI", "HICP"),
+    "COICOP_1999": ("_T",),
+    "TYPE_OF_TRANSFORMATION": ("IX",),
+    "FREQUENCY": ("M",),
+}
+ER_PREFS = {
+    "INDICATOR": ("XDC_USD",),
+    "TYPE_OF_TRANSFORMATION": ("PA_RT",),
+    "FREQUENCY": ("M",),
+}
 START_DATE = pd.Timestamp("1976-01-01")
 EURO_AREA = "G163"
 USA = "USA"
@@ -123,11 +135,11 @@ def parse_sdmx_csv(text: str) -> pd.Series:
     return _to_series(df[cols["TIME_PERIOD"]], df[cols["OBS_VALUE"]])
 
 
-def parse_sdmx_json(payload: dict) -> pd.Series:
+def parse_sdmx_json_all(payload: dict) -> list[tuple[dict[str, str], pd.Series]]:
     """Parse an SDMX-JSON data message (v1.0 or v2.0 layouts).
 
-    Handles time-series observations (series -> observations) as well as the
-    flat AllDimensions layout (observation key like "0:0:5").
+    Returns (series dimension values, monthly series) for every series.
+    Handles time-series observations as well as the flat AllDimensions layout.
     """
     root = payload.get("data", payload) if isinstance(payload, dict) else {}
     structure = root.get("structure") or (root.get("structures") or [None])[0]
@@ -137,35 +149,61 @@ def parse_sdmx_json(payload: dict) -> pd.Series:
     dims = structure.get("dimensions", {})
     obs_dims = dims.get("observation", [])
     series_dims = dims.get("series", [])
-    time_pos = next((i for i, d in enumerate(obs_dims) if d.get("id") == "TIME_PERIOD"), None)
 
     def label_of(v: dict) -> str:
         return v.get("id") or v.get("value") or v.get("name") or ""
 
-    periods, values = [], []
     ds = datasets[0]
+    out: list[tuple[dict[str, str], pd.Series]] = []
     if ds.get("series"):
-        if time_pos is None:
-            time_pos = 0
-        times = [label_of(v) for v in obs_dims[time_pos]["values"]]
-        # The key restricts the query to one series; take the first.
-        series = next(iter(ds["series"].values()))
-        for idx, obs in series.get("observations", {}).items():
-            periods.append(times[int(idx)])
-            values.append(obs[0])
+        t = next((i for i, d in enumerate(obs_dims) if d.get("id") == "TIME_PERIOD"), 0)
+        times = [label_of(v) for v in obs_dims[t]["values"]]
+        for skey, sdata in ds["series"].items():
+            attrs = {
+                d.get("id", str(i)): label_of(d["values"][int(pos)])
+                for i, (d, pos) in enumerate(zip(series_dims, skey.split(":")))
+            }
+            obs = sdata.get("observations", {})
+            if not obs:
+                continue
+            periods = [times[int(i)] for i in obs]
+            vals = [o[0] for o in obs.values()]
+            try:
+                out.append((attrs, _to_series(pd.Series(periods), pd.Series(vals))))
+            except IMFDataError:
+                continue
     elif ds.get("observations"):
-        # Flat layout: key is colon-joined indices over series + observation dims.
         all_dims = series_dims + obs_dims
         t = next((i for i, d in enumerate(all_dims) if d.get("id") == "TIME_PERIOD"), None)
         if t is None:
             raise IMFDataError("No TIME_PERIOD dimension in JSON.")
         times = [label_of(v) for v in all_dims[t]["values"]]
-        for key, obs in ds["observations"].items():
-            periods.append(times[int(key.split(":")[t])])
-            values.append(obs[0])
-    else:
-        raise IMFDataError("JSON response contains no observations.")
-    return _to_series(pd.Series(periods), pd.Series(values))
+        periods = [times[int(k.split(":")[t])] for k in ds["observations"]]
+        vals = [o[0] for o in ds["observations"].values()]
+        out.append(({}, _to_series(pd.Series(periods), pd.Series(vals))))
+    if not out:
+        raise IMFDataError("no data for this key (empty dataset)")
+    return out
+
+
+def parse_sdmx_json(payload: dict) -> pd.Series:
+    """Parse an SDMX-JSON message holding a single series."""
+    return parse_sdmx_json_all(payload)[0][1]
+
+
+def pick_series(
+    candidates: list[tuple[dict[str, str], pd.Series]], prefs: dict[str, tuple[str, ...]]
+) -> pd.Series:
+    """Choose the series whose dimensions best match prefs; ties go to the longest."""
+    def score(item: tuple[dict[str, str], pd.Series]) -> tuple[int, int]:
+        attrs, ser = item
+        hits = sum(1 for dim, ok in prefs.items() if attrs.get(dim) in ok)
+        return hits, ser.notna().sum()
+    best = max(candidates, key=score)
+    if score(best)[0] < len(prefs) - 1:
+        found = sorted({f"{k}={v}" for a, _ in candidates[:6] for k, v in a.items()})
+        raise IMFDataError(f"no series matches the expected dimensions (found {found[:12]})")
+    return best[1]
 
 
 def _to_series(periods: pd.Series, values: pd.Series) -> pd.Series:
@@ -179,9 +217,20 @@ def _to_series(periods: pd.Series, values: pd.Series) -> pd.Series:
     return s
 
 
+def _get(url: str, accept: str) -> requests.Response | str:
+    try:
+        return requests.get(url, headers={"Accept": accept}, timeout=60)
+    except requests.RequestException as exc:
+        return f"network error: {exc}"
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def fetch_series(flow: str, key: str) -> pd.Series:
-    """Download one monthly series from the IMF API (all history, from 1976)."""
+def fetch_series(flow: str, key: str, wildcard: str = "", prefs: tuple = ()) -> pd.Series:
+    """Download one monthly series from the IMF API (history from 1976).
+
+    If the exact key holds no data and a wildcard key is given, fetch every
+    series matching it and choose the closest match to prefs.
+    """
     last_error = "unknown error"
     attempts = (
         ("application/vnd.sdmx.data+csv;version=2.0.0", "csv"),
@@ -189,12 +238,11 @@ def fetch_series(flow: str, key: str) -> pd.Series:
         ("application/json", "json"),
     )
     for version in VERSION_TOKENS:
-        url = f"{IMF_BASE}/data/dataflow/{flow}/{version}/{key}"
+        base = f"{IMF_BASE}/data/dataflow/{flow}/{version}"
         for accept, kind in attempts:
-            try:
-                resp = requests.get(url, headers={"Accept": accept}, timeout=60)
-            except requests.RequestException as exc:
-                last_error = f"network error: {exc}"
+            resp = _get(f"{base}/{key}", accept)
+            if isinstance(resp, str):
+                last_error = resp
                 continue
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code} ({accept})"
@@ -206,17 +254,29 @@ def fetch_series(flow: str, key: str) -> pd.Series:
                 last_error = f"{exc} ({accept}; response starts: {snippet!r})"
                 continue
             return s[s.index >= START_DATE]
+        if wildcard:
+            resp = _get(f"{base}/{wildcard}", "application/json")
+            if not isinstance(resp, str) and resp.status_code == 200:
+                try:
+                    cands = parse_sdmx_json_all(resp.json())
+                    return pick_series(cands, dict(prefs)).loc[START_DATE:]
+                except (IMFDataError, ValueError) as exc:
+                    last_error += f"; wildcard {wildcard}: {exc}"
     raise IMFDataError(f"{key}: {last_error}")
 
 
 def load_country(iso: str) -> tuple[pd.Series, pd.Series]:
     """Return (CPI index, local-currency units per USD) for a country."""
-    cpi = fetch_series(CPI_FLOW, CPI_KEY.format(iso=iso))
+    cpi = fetch_series(
+        CPI_FLOW, CPI_KEY.format(iso=iso), f"{iso}.*.*.*.M", tuple(CPI_PREFS.items())
+    )
     if iso == USA:
         # The dollar is the numeraire: 1 USD per USD in every month.
         er = pd.Series(1.0, index=cpi.index)
     else:
-        er = fetch_series(ER_FLOW, ER_KEY.format(iso=iso))
+        er = fetch_series(
+            ER_FLOW, ER_KEY.format(iso=iso), f"{iso}.*.*.M", tuple(ER_PREFS.items())
+        )
     return cpi, er
 
 
